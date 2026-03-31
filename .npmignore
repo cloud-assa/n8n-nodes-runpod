@@ -1,0 +1,4 @@
+nodes/**/*.ts
+credentials/**/*.ts
+tsconfig.json
+.gitignore
