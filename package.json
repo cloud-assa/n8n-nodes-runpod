@@ -21,7 +21,7 @@
   },
   "main": "dist/nodes/RunPodChatModel/RunPodChatModel.node.js",
   "scripts": {
-    "build": "tsc && cp nodes/RunPodChatModel/runpod.svg dist/nodes/RunPodChatModel/runpod.svg",
+    "build": "tsc && node -e \"require('fs').copyFileSync('nodes/RunPodChatModel/runpod.svg','dist/nodes/RunPodChatModel/runpod.svg')\"",
     "prepublishOnly": "npm run build"
   },
   "files": [
