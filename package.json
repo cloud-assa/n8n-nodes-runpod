@@ -11,13 +11,13 @@
     "language-model"
   ],
   "license": "MIT",
-  "homepage": "https://github.com/CLOUD_ASSA/n8n-nodes-runpod",
+  "homepage": "https://github.com/cloud-assa/n8n-nodes-runpod",
   "author": {
-    "name": "CLOUD_ASSA"
+    "name": "cloud-assa"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/CLOUD_ASSA/n8n-nodes-runpod.git"
+    "url": "https://github.com/cloud-assa/n8n-nodes-runpod.git"
   },
   "main": "dist/nodes/RunPodChatModel/RunPodChatModel.node.js",
   "scripts": {
