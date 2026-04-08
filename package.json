@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-runpod",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "description": "n8n community node to connect RunPod Serverless LLM endpoints to Basic LLM Chain and AI Agent",
   "keywords": [
     "n8n-community-node-package",
@@ -21,7 +21,7 @@
   },
   "main": "dist/nodes/RunPodChatModel/RunPodChatModel.node.js",
   "scripts": {
-    "build": "tsc && node -e \"require('fs').copyFileSync('nodes/RunPodChatModel/runpod.svg','dist/nodes/RunPodChatModel/runpod.svg')\"",
+    "build": "tsc && node -e \"require('fs').copyFileSync('nodes/RunPodChatModel/daat.png','dist/nodes/RunPodChatModel/daat.png')\"",
     "prepublishOnly": "npm run build"
   },
   "files": [

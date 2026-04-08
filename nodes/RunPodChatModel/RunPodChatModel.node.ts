@@ -32,7 +32,7 @@ interface RunPodLLMParams extends BaseChatModelParams {
 	modelName?: string;
 	temperature?: number;
 	maxTokens?: number;
-	pollingInterval?: number;
+	useSyncEndpoint?: boolean;
 	maxWaitTime?: number;
 }
 
@@ -53,13 +53,18 @@ interface RunPodStatusResponse {
 	error?: string;
 }
 
+interface SyncResult {
+	text?: string;
+	jobId?: string;
+}
+
 class RunPodLLM extends BaseChatModel {
 	private apiKey: string;
 	private endpointId: string;
 	private modelName: string;
 	private temperature: number;
 	private maxTokens: number;
-	private pollingInterval: number;
+	private useSyncEndpoint: boolean;
 	private maxWaitTime: number;
 
 	constructor(params: RunPodLLMParams) {
@@ -68,8 +73,8 @@ class RunPodLLM extends BaseChatModel {
 		this.endpointId = params.endpointId;
 		this.modelName = params.modelName ?? '';
 		this.temperature = params.temperature ?? 0.7;
-		this.maxTokens = params.maxTokens ?? 1024;
-		this.pollingInterval = params.pollingInterval ?? 2;
+		this.maxTokens = params.maxTokens ?? 0;
+		this.useSyncEndpoint = params.useSyncEndpoint !== false; // true by default
 		this.maxWaitTime = params.maxWaitTime ?? 300;
 	}
 
@@ -77,6 +82,7 @@ class RunPodLLM extends BaseChatModel {
 		return 'runpod';
 	}
 
+	// ── Message formatting ───────────────────────────────────────────────────
 	private formatMessages(messages: BaseMessage[]): { prompt: string; messages: RunPodMessage[] } {
 		const formatted: RunPodMessage[] = messages.map((msg) => {
 			let role: 'system' | 'user' | 'assistant';
@@ -104,17 +110,16 @@ class RunPodLLM extends BaseChatModel {
 		};
 	}
 
+	// ── Output extraction (handles all RunPod response shapes) ───────────────
 	private extractText(output: unknown): string {
 		if (output === null || output === undefined) {
 			return '';
 		}
 
-		// String directo
 		if (typeof output === 'string') {
 			return output;
 		}
 
-		// Array
 		if (Array.isArray(output)) {
 			if (output.length === 0) return '';
 			const first = output[0];
@@ -125,16 +130,25 @@ class RunPodLLM extends BaseChatModel {
 				if (typeof obj.text === 'string') return obj.text;
 				if (typeof obj.content === 'string') return obj.content;
 			}
+			// Try to extract from choices (OpenAI-compatible workers)
+			if (typeof output[0] === 'object' && (output[0] as Record<string, unknown>).choices) {
+				return this.extractText(output[0]);
+			}
 			return JSON.stringify(output);
 		}
 
-		// Objeto
 		if (typeof output === 'object') {
 			const obj = output as Record<string, unknown>;
+			// OpenAI-compatible response shape
+			if (Array.isArray(obj.choices) && obj.choices.length > 0) {
+				const choice = obj.choices[0] as Record<string, unknown>;
+				const message = choice.message as Record<string, unknown> | undefined;
+				if (message?.content) return String(message.content);
+				if (choice.text) return String(choice.text);
+			}
 			if (typeof obj.text === 'string') return obj.text;
 			if (typeof obj.content === 'string') return obj.content;
 			if (typeof obj.response === 'string') return obj.response;
-			if (typeof obj.output === 'string') return obj.output;
 			if (typeof obj.generated_text === 'string') return obj.generated_text;
 			// Recurse into nested output field
 			if (obj.output !== undefined && obj.output !== null) {
@@ -142,97 +156,166 @@ class RunPodLLM extends BaseChatModel {
 			}
 		}
 
-		// Fallback
 		return JSON.stringify(output);
 	}
 
-	private sleep(ms: number): Promise<void> {
-		return new Promise((resolve) => setTimeout(resolve, ms));
+	// ── Fetch with AbortController timeout ──────────────────────────────────
+	private async fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
+		const controller = new AbortController();
+		const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+		try {
+			return await fetch(url, { ...options, signal: controller.signal });
+		} finally {
+			clearTimeout(timeoutId);
+		}
 	}
 
-	async _generate(
-		messages: BaseMessage[],
-		_options: this['ParsedCallOptions'],
-		_runManager?: CallbackManagerForLLMRun,
-	): Promise<ChatResult> {
-		const { prompt, messages: formattedMessages } = this.formatMessages(messages);
-
-		const runUrl = `https://api.runpod.ai/v2/${this.endpointId}/run`;
-		const headers = {
-			'Authorization': `Bearer ${this.apiKey}`,
-			'Content-Type': 'application/json',
-		};
-
+	// ── Build request body ───────────────────────────────────────────────────
+	private buildBody(prompt: string, formattedMessages: RunPodMessage[]): Record<string, unknown> {
 		const body: Record<string, unknown> = {
 			input: {
 				prompt,
 				messages: formattedMessages,
 				temperature: this.temperature,
-				max_tokens: this.maxTokens,
-			},
+			} as Record<string, unknown>,
 		};
+		// Only send max_tokens if the user set a value > 0; 0 means "let the model decide"
+		if (this.maxTokens > 0) (body.input as Record<string, unknown>).max_tokens = this.maxTokens;
+		if (this.modelName) (body.input as Record<string, unknown>).model = this.modelName;
+		return body;
+	}
 
-		if (this.modelName) {
-			(body.input as Record<string, unknown>).model = this.modelName;
-		}
-
-		// Enviar job
-		const submitRes = await fetch(runUrl, {
+	// ── Strategy 1: /runsync — single request, server waits up to 90 s ──────
+	private async tryRunSync(body: Record<string, unknown>, headers: Record<string, string>): Promise<SyncResult | null> {
+		const url = `https://api.runpod.ai/v2/${this.endpointId}/runsync`;
+		// Give network 5 s of buffer beyond the server-side 90 s limit
+		const res = await this.fetchWithTimeout(url, {
 			method: 'POST',
 			headers,
 			body: JSON.stringify(body),
-		});
+		}, 95000);
 
-		if (!submitRes.ok) {
-			const errText = await submitRes.text();
-			throw new Error(`RunPod error ${submitRes.status}: ${errText}`);
+		if (!res.ok) {
+			throw new Error(`RunPod /runsync ${res.status}: ${await res.text()}`);
 		}
+		const data = await res.json() as RunPodStatusResponse & { id?: string };
 
-		const jobData = (await submitRes.json()) as RunPodJobResponse;
-		const jobId = jobData.id;
-
-		if (!jobId) {
-			throw new Error('RunPod no devolvió job ID');
+		if (data.status === 'COMPLETED') return { text: this.extractText(data.output) };
+		if (data.status === 'FAILED' || data.status === 'CANCELLED') {
+			throw new Error(`RunPod job failed: ${data.error ?? data.status}`);
 		}
+		// IN_QUEUE / IN_PROGRESS — server returned early with a job ID
+		if (data.id) return { jobId: data.id };
+		return null;
+	}
 
-		// Polling
-		const statusUrl = `https://api.runpod.ai/v2/${this.endpointId}/status/${jobId}`;
-		const maxAttempts = Math.floor(this.maxWaitTime / this.pollingInterval);
-
-		for (let attempt = 0; attempt < maxAttempts; attempt++) {
-			await this.sleep(this.pollingInterval * 1000);
-
-			const statusRes = await fetch(statusUrl, { headers });
-
-			if (!statusRes.ok) {
-				const errText = await statusRes.text();
-				throw new Error(`RunPod error ${statusRes.status}: ${errText}`);
-			}
-
-			const statusData = (await statusRes.json()) as RunPodStatusResponse;
-
-			if (statusData.status === 'COMPLETED') {
-				const text = this.extractText(statusData.output);
-				const generation: ChatGeneration = {
-					text,
-					message: new AIMessage(text),
-				};
-				return { generations: [generation] };
-			}
-
-			if (statusData.status === 'FAILED' || statusData.status === 'CANCELLED') {
-				throw new Error(`RunPod job falló: ${statusData.error ?? statusData.status}`);
-			}
-
-			// IN_QUEUE, IN_PROGRESS, TIMED_OUT → seguir esperando o lanzar
-			if (statusData.status === 'TIMED_OUT') {
-				throw new Error(`RunPod job falló: TIMED_OUT en el servidor`);
-			}
+	// ── Strategy 2: /run + adaptive polling ─────────────────────────────────
+	private async submitAsync(body: Record<string, unknown>, headers: Record<string, string>): Promise<string> {
+		const url = `https://api.runpod.ai/v2/${this.endpointId}/run`;
+		const res = await this.fetchWithTimeout(url, {
+			method: 'POST',
+			headers,
+			body: JSON.stringify(body),
+		}, 30000);
+		if (!res.ok) {
+			throw new Error(`RunPod /run ${res.status}: ${await res.text()}`);
 		}
+		const data = await res.json() as RunPodJobResponse;
+		if (!data.id) throw new Error('RunPod did not return a job ID');
+		return data.id;
+	}
 
+	private async pollForResult(jobId: string, headers: Record<string, string>): Promise<string> {
+		const url = `https://api.runpod.ai/v2/${this.endpointId}/status/${jobId}`;
+		const deadline = Date.now() + this.maxWaitTime * 1000;
+		// Adaptive interval: 1 s → 5 s (grows 20 % per check)
+		let interval = 1000;
+		let networkRetries = 0;
+
+		while (Date.now() < deadline) {
+			await new Promise<void>((r) => setTimeout(r, interval));
+
+			let data: RunPodStatusResponse;
+			try {
+				const res = await this.fetchWithTimeout(url, { headers } as RequestInit, 15000);
+				if (!res.ok) {
+					if (res.status >= 500 && networkRetries < 3) {
+						networkRetries++;
+						continue;
+					}
+					throw new Error(`RunPod status ${res.status}: ${await res.text()}`);
+				}
+				data = await res.json() as RunPodStatusResponse;
+				networkRetries = 0;
+			} catch (err) {
+				if (networkRetries < 3) {
+					networkRetries++;
+					interval = Math.min(interval * 2, 5000);
+					continue;
+				}
+				throw err;
+			}
+
+			if (data.status === 'COMPLETED') return this.extractText(data.output);
+			if (data.status === 'FAILED' || data.status === 'CANCELLED') {
+				throw new Error(`RunPod job failed: ${data.error ?? data.status}`);
+			}
+			if (data.status === 'TIMED_OUT') {
+				throw new Error('RunPod job timed out on the server side');
+			}
+
+			interval = Math.min(Math.floor(interval * 1.2), 5000);
+		}
 		throw new Error(
-			`RunPod timeout: el job ${jobId} no terminó en ${this.maxWaitTime} segundos`,
+			`RunPod timeout: job ${jobId} did not complete within ${this.maxWaitTime} s`,
 		);
+	}
+
+	// ── Main entry point ─────────────────────────────────────────────────────
+	async _generate(
+		messages: BaseMessage[],
+		_options: this['ParsedCallOptions'],
+		_runManager?: CallbackManagerForLLMRun,
+	): Promise<ChatResult> {
+		const { prompt, messages: fmt } = this.formatMessages(messages);
+		const headers: Record<string, string> = {
+			'Authorization': `Bearer ${this.apiKey}`,
+			'Content-Type': 'application/json',
+		};
+		const body = this.buildBody(prompt, fmt);
+		let text: string;
+
+		if (this.useSyncEndpoint) {
+			// Fast path: single HTTP call via /runsync
+			let syncResult: SyncResult | null;
+			try {
+				syncResult = await this.tryRunSync(body, headers);
+			} catch (err) {
+				// AbortError = runsync timed out locally → fall back to async
+				if ((err as Error).name === 'AbortError' || String((err as Error).message).includes('abort')) {
+					syncResult = null;
+				} else {
+					throw err;
+				}
+			}
+
+			if (syncResult?.text !== undefined) {
+				text = syncResult.text;
+			} else if (syncResult?.jobId) {
+				// runsync gave us a job ID — continue polling
+				text = await this.pollForResult(syncResult.jobId, headers);
+			} else {
+				// Full fallback: submit async + poll
+				const jobId = await this.submitAsync(body, headers);
+				text = await this.pollForResult(jobId, headers);
+			}
+		} else {
+			const jobId = await this.submitAsync(body, headers);
+			text = await this.pollForResult(jobId, headers);
+		}
+
+		const generation: ChatGeneration = { text, message: new AIMessage(text) };
+		return { generations: [generation] };
 	}
 }
 
@@ -242,7 +325,7 @@ export class RunPodChatModel implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'RunPod Chat Model',
 		name: 'runPodChatModel',
-		icon: 'file:runpod.svg',
+		icon: 'file:daat.png',
 		group: ['transform'],
 		version: 1,
 		description: 'Conecta tu modelo de RunPod Serverless al Basic LLM Chain y AI Agent',
@@ -279,7 +362,7 @@ export class RunPodChatModel implements INodeType {
 				default: '',
 				placeholder: 'meta-llama/Llama-3.1-8B-Instruct',
 				description:
-					'Nombre del modelo a usar. Déjalo vacío si tu worker ya tiene el modelo fijo.',
+					'Nombre del modelo a usar. D\u00e9jalo vac\u00edo si tu worker ya tiene el modelo fijo.',
 			},
 			{
 				displayName: 'Temperature',
@@ -298,22 +381,17 @@ export class RunPodChatModel implements INodeType {
 				name: 'maxTokens',
 				type: 'number',
 				typeOptions: {
-					minValue: 1,
-					maxValue: 32768,
+					minValue: 0,
 				},
-				default: 1024,
-				description: 'Número máximo de tokens en la respuesta',
+				default: 0,
+				description: 'N\u00famero m\u00e1ximo de tokens en la respuesta. Usa 0 para dejar que el modelo decida (sin l\u00edmite fijo).',
 			},
 			{
-				displayName: 'Polling Interval (seconds)',
-				name: 'pollingInterval',
-				type: 'number',
-				typeOptions: {
-					minValue: 1,
-					maxValue: 30,
-				},
-				default: 2,
-				description: 'Segundos entre cada check de status del job en RunPod',
+				displayName: 'Use Sync Endpoint',
+				name: 'useSyncEndpoint',
+				type: 'boolean',
+				default: true,
+				description: 'Whether to use /runsync (faster, single request) instead of /run + polling. Disable only if your worker does not support it.',
 			},
 			{
 				displayName: 'Max Wait Time (seconds)',
@@ -324,7 +402,7 @@ export class RunPodChatModel implements INodeType {
 					maxValue: 600,
 				},
 				default: 300,
-				description: 'Tiempo máximo de espera en segundos antes de dar timeout',
+				description: 'Tiempo m\u00e1ximo de espera en segundos antes de dar timeout (aplica solo al modo polling)',
 			},
 		],
 	};
@@ -334,8 +412,8 @@ export class RunPodChatModel implements INodeType {
 
 		const modelName = this.getNodeParameter('modelName', itemIndex, '') as string;
 		const temperature = this.getNodeParameter('temperature', itemIndex, 0.7) as number;
-		const maxTokens = this.getNodeParameter('maxTokens', itemIndex, 1024) as number;
-		const pollingInterval = this.getNodeParameter('pollingInterval', itemIndex, 2) as number;
+		const maxTokens = this.getNodeParameter('maxTokens', itemIndex, 0) as number;
+		const useSyncEndpoint = this.getNodeParameter('useSyncEndpoint', itemIndex, true) as boolean;
 		const maxWaitTime = this.getNodeParameter('maxWaitTime', itemIndex, 300) as number;
 
 		const model = new RunPodLLM({
@@ -344,7 +422,7 @@ export class RunPodChatModel implements INodeType {
 			modelName,
 			temperature,
 			maxTokens,
-			pollingInterval,
+			useSyncEndpoint,
 			maxWaitTime,
 		});
 
